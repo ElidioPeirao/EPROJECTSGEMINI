@@ -1,0 +1,64 @@
+Crie um site completo para a empresa EPROJECTS com design minimalista usando paleta de cores preto e laranja.  
+
+1. Layout geral  
+- Barra de navegação com o logo “EPROJECTS” no canto esquerdo e nome das guias “EPROJECTS” à direita.  
+- Tipografia limpa, sem serifa, e espaçamento generoso.  
+
+2. Tela de Login / Cadastro  
+- Aba “Entrar” e aba “Criar conta” lado a lado.  
+- Em ambas, campos:  
+  • Usuário (text input)  
+  • E-mail (text input)  
+  • Senha (password input) com ícone para mostrar/ocultar.  
+  • Código bônus (text input opcional)  
+- Botões: “Entrar” ou “Criar conta” conforme a aba.  
+- Validação inline de e-mail e senha (mínimo de 6 caracteres).  
+
+3. Dashboard de usuário  
+- Após login, redirecionar para dashboard com título “EPROJECTS”.  
+- Dois grandes botões centrais, lado a lado:  
+  • “Calculadora Mecânica”  
+  • “Calculadora Elétrica”  
+- Cada botão leva à página respectiva.  
+
+4. Tela de Administração (acessível somente para usuário admin)   
+- No dashboard aparece adicionalmente uma guia “Administrador” no topo.  
+- Na guia “Administrador”:  
+  • Lista de usuários existentes com ações Editar e Excluir.  
+  • Formulário para criar novo usuário, incluindo:  
+    – Nome de usuário  
+    – E-mail  
+    – Senha  
+    – Papel (Basic | Pro | Admin)  
+  • Permissões:  
+    – Basic: acesso apenas às calculadoras básicas.  
+    – Pro: acesso às básicas + recursos Pro.  
+    – Admin: acesso total, incluindo painel de administração.  
+  • Seção “Personalizar Dashboard”:  
+    – Formulário para criar novos botões na página principal:  
+      ◦ Categoria (dropdown: Mecânica ou Elétrica)  
+      ◦ Descrição (text input)  
+      ◦ Link de destino (text input URL)  
+      ◦ Nível de acesso (Basic | Pro)  
+
+5. Estilo e responsividade  
+- Design minimalista em preto (#000) e laranja (#F60), com muito espaço em branco.  
+- Botões com cantos arredondados e leve sombra.  
+- Mobile-first: grade fluida e menu “hamburger” em telas pequenas.  
+
+Gere código HTML/CSS/JavaScript (ou framework de sua escolha), com modelo de autenticação simulado em front-end, e componentes reutilizáveis para formulários e botões.  
+
+
+
+
+
+
+faça o layout baseado em engenharia mecanica e faça o sistema de login e com banco de dados, e coloque para quando criar uma ferramenta, poder escolher se vai ser link externo
+
+faça para quando clicar nos filtos, ele mostre somente as ferramentas que tenham aquele filtro determinado
+
+faça para quando criar a conta e inserir o codigo ELIDIOFODA, a conta seja criada como admin
+
+faça na aba admin, que eu possa criar codigos promocionais de pro, onde eu escolho a quantidade de dias e quantos uso ele pode ter e ele gera um codigo, e conforme as pessoas usam, diminui o total dele, e coloque para definir quantos dias os usuarios ficaram com pro
+
+faça na tela de administrador que eu possa escolher quantos dias de pro o usuario vai ter, e remova o codigo promocional da tela de login deixe apenas na de cadastro e um botao para colocar o codigo dento da dashboard
