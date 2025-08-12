@@ -1,0 +1,1796 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { setupAuth } from "./auth";
+import { eq } from "drizzle-orm";
+import * as schema from "@shared/schema";
+import { promisify } from "util";
+import { scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { WebSocketServer, WebSocket } from "ws";
+import { pool, db } from "@db";
+import Stripe from "stripe";
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Inicializar Stripe
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
+  
+  // Setup authentication routes
+  setupAuth(app);
+  
+  // Definição de planos
+  const PLANS: {
+    [key: string]: {
+      name: string;
+      description: string;
+      price: number;
+      days: number;
+      role: string;
+    }
+  } = {
+    'E-TOOL': {
+      name: 'Plano E-TOOL',
+      description: 'Acesso a todas as ferramentas E-BASIC e E-TOOL',
+      price: 9900, // R$ 99,00 em centavos
+      days: 90, // 3 meses
+      role: 'E-TOOL'
+    },
+    'E-MASTER': {
+      name: 'Plano E-MASTER',
+      description: 'Acesso a todas as ferramentas e cursos da plataforma',
+      price: 19900, // R$ 199,00 em centavos
+      days: 180, // 6 meses
+      role: 'E-MASTER'
+    }
+  };
+
+  // Get all tools
+  app.get("/api/tools", async (req, res) => {
+    try {
+      const tools = await storage.getAllTools();
+      res.json(tools);
+    } catch (error) {
+      console.error("Error fetching tools:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get all users (admin only)
+  app.get("/api/users", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const users = await storage.getAllUsers();
+      
+      // Remove sensitive data like passwords
+      const safeUsers = users.map(user => {
+        const { password, ...userWithoutPassword } = user;
+        return userWithoutPassword;
+      });
+      
+      res.json(safeUsers);
+    } catch (error) {
+      console.error("Error fetching users:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create new user (admin only)
+  app.post("/api/users", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { username, email, password, role, proDays } = req.body;
+      
+      // Check if email already exists
+      const existingEmail = await storage.getUserByEmail(email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Email já está em uso" });
+      }
+      
+      // Check if username already exists
+      const existingUsername = await storage.getUserByUsername(username);
+      if (existingUsername) {
+        return res.status(400).json({ message: "Nome de usuário já está em uso" });
+      }
+      
+      // Hash the password
+      const scryptAsync = promisify(scrypt);
+      const salt = randomBytes(16).toString("hex");
+      const buf = (await scryptAsync(password, salt, 64)) as Buffer;
+      const hashedPassword = `${buf.toString("hex")}.${salt}`;
+      
+      // Create the user
+      const user = await storage.createUser({
+        username,
+        email,
+        password: hashedPassword,
+        cpf: req.body.cpf || "",  // CPF é obrigatório, mas usamos string vazia para admin
+        role: role as any,
+      });
+      
+      // If proDays is provided, extend pro status
+      if (proDays && parseInt(proDays) > 0) {
+        await storage.extendProStatus(user.id, parseInt(proDays));
+      }
+      
+      // Remove password from response
+      const { password: _, ...userWithoutPassword } = user;
+      
+      res.status(201).json(userWithoutPassword);
+    } catch (error) {
+      console.error("Error creating user:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Update user (admin only)
+  app.patch("/api/users/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const userId = parseInt(req.params.id);
+      const { username, email, role, proDays, cpf } = req.body;
+      
+      // Check if user exists
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Check if email already exists (if changing email)
+      if (email && email !== user.email) {
+        const existingEmail = await storage.getUserByEmail(email);
+        if (existingEmail && existingEmail.id !== userId) {
+          return res.status(400).json({ message: "Email já está em uso" });
+        }
+      }
+      
+      // Check if username already exists (if changing username)
+      if (username && username !== user.username) {
+        const existingUsername = await storage.getUserByUsername(username);
+        if (existingUsername && existingUsername.id !== userId) {
+          return res.status(400).json({ message: "Nome de usuário já está em uso" });
+        }
+      }
+      
+      // Verificar se é o admin modificando outro usuário
+      const isAdminEditingOtherUser = req.user.role === 'admin' && req.user.id !== userId;
+      
+      // Preparar os dados para atualização
+      const updateData: any = {};
+      
+      // Adicionar apenas os campos que foram fornecidos
+      if (username) updateData.username = username;
+      if (email) updateData.email = email;
+      if (role) updateData.role = role as any;
+      
+      // Se for um usuário editando seu próprio perfil, CPF é obrigatório
+      if (!isAdminEditingOtherUser) {
+        if (!cpf) {
+          return res.status(400).json({ message: "CPF é obrigatório para atualização do perfil" });
+        }
+        updateData.cpf = cpf;
+      } 
+      // Se for admin editando outro usuário e cpf foi fornecido, atualizar o cpf
+      else if (cpf) {
+        updateData.cpf = cpf;
+      }
+      
+      // Se não há dados para atualizar, retornar erro
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ message: "Nenhum dado fornecido para atualização" });
+      }
+      
+      // Update the user
+      const updatedUser = await storage.updateUser(userId, updateData);
+      
+      // If proDays is provided, extend pro status
+      if (proDays && parseInt(proDays) > 0) {
+        await storage.extendProStatus(userId, parseInt(proDays));
+      }
+      
+      if (!updatedUser) {
+        return res.status(404).json({ message: "Falha ao atualizar usuário" });
+      }
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = updatedUser;
+      
+      res.json(userWithoutPassword);
+    } catch (error) {
+      console.error("Error updating user:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Reset user password (admin only)
+  app.patch("/api/users/:id/reset-password", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const userId = parseInt(req.params.id);
+      const { password } = req.body;
+      
+      // Check if user exists
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Hash the password
+      const scryptAsync = promisify(scrypt);
+      const salt = randomBytes(16).toString("hex");
+      const buf = (await scryptAsync(password, salt, 64)) as Buffer;
+      const hashedPassword = `${buf.toString("hex")}.${salt}`;
+      
+      // Update the user's password
+      const updatedUser = await storage.updateUser(userId, {
+        password: hashedPassword
+      });
+      
+      if (!updatedUser) {
+        return res.status(404).json({ message: "Falha ao atualizar senha" });
+      }
+      
+      res.json({ success: true, message: "Senha redefinida com sucesso" });
+    } catch (error) {
+      console.error("Error resetting password:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Delete user (admin only)
+  app.delete("/api/users/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const userId = parseInt(req.params.id);
+      
+      // Prevent deleting your own account
+      if (userId === req.user.id) {
+        return res.status(400).json({ message: "Você não pode excluir sua própria conta" });
+      }
+      
+      // Check if user exists
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Usuário não encontrado" });
+      }
+      
+      // Delete the user
+      const success = await storage.deleteUser(userId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Falha ao excluir usuário" });
+      }
+      
+      res.json({ success: true, message: "Usuário excluído com sucesso" });
+    } catch (error) {
+      console.error("Error deleting user:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get all courses
+  app.get("/api/courses", async (req, res) => {
+    try {
+      // Admin can see all courses, others only visible ones
+      if (req.isAuthenticated() && req.user.role === "admin") {
+        const courses = await storage.getAllCourses(true);
+        res.json(courses);
+      } else {
+        const courses = await storage.getVisibleCourses();
+        res.json(courses);
+      }
+    } catch (error) {
+      console.error("Error fetching courses:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create new course (admin only)
+  app.post("/api/courses", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const courseData = {
+        ...req.body,
+        createdBy: req.user.id,
+        isHidden: req.body.isHidden || false
+      };
+      
+      const course = await storage.createCourse(courseData);
+      
+      res.status(201).json(course);
+    } catch (error) {
+      console.error("Error creating course:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Update course (admin only)
+  app.patch("/api/courses/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const courseId = parseInt(req.params.id);
+      
+      // Check if course exists
+      const course = await storage.getCourseById(courseId);
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      const updatedCourse = await storage.updateCourse(courseId, req.body);
+      
+      if (!updatedCourse) {
+        return res.status(500).json({ message: "Falha ao atualizar curso" });
+      }
+      
+      res.json(updatedCourse);
+    } catch (error) {
+      console.error("Error updating course:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Delete course (admin only)
+  app.delete("/api/courses/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const courseId = parseInt(req.params.id);
+      
+      // Check if course exists
+      const course = await storage.getCourseById(courseId);
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      const success = await storage.deleteCourse(courseId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Falha ao excluir curso" });
+      }
+      
+      res.json({ success: true, message: "Curso excluído com sucesso" });
+    } catch (error) {
+      console.error("Error deleting course:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Toggle course visibility (admin only)
+  app.patch("/api/courses/:id/toggle-visibility", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const courseId = parseInt(req.params.id);
+      const { isHidden } = req.body;
+      
+      if (isHidden === undefined) {
+        return res.status(400).json({ message: "O campo isHidden é obrigatório" });
+      }
+      
+      // Check if course exists
+      const course = await storage.getCourseById(courseId);
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      const updatedCourse = await storage.toggleCourseVisibility(courseId, isHidden);
+      
+      if (!updatedCourse) {
+        return res.status(500).json({ message: "Falha ao atualizar visibilidade do curso" });
+      }
+      
+      res.json(updatedCourse);
+    } catch (error) {
+      console.error("Error toggling course visibility:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get all promo codes (admin only)
+  app.get("/api/promocodes", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const promoCodes = await storage.getAllPromoCodes();
+      res.json(promoCodes);
+    } catch (error) {
+      console.error("Error fetching promo codes:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create new promo code (admin only)
+  app.post("/api/promocodes", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { code, days, maxUses, promoType, targetRole, courseId, expiryDate } = req.body;
+      
+      // Check if code already exists
+      const existingPromoCode = await storage.getPromoCodeByCode(code);
+      if (existingPromoCode) {
+        return res.status(400).json({ message: "Código promocional já existe" });
+      }
+      
+      // Convert days and maxUses to numbers
+      const daysNum = parseInt(days);
+      const maxUsesNum = parseInt(maxUses);
+      
+      // Convert courseId to number if provided
+      let courseIdNum = undefined;
+      if (courseId) {
+        courseIdNum = parseInt(courseId);
+        
+        // Verify course exists if courseId is provided
+        if (promoType === 'course') {
+          const course = await storage.getCourseById(courseIdNum);
+          if (!course) {
+            return res.status(400).json({ message: "Curso não encontrado" });
+          }
+        }
+      }
+      
+      // Calculate expiry date if provided
+      let expiryDateObj = undefined;
+      if (expiryDate) {
+        expiryDateObj = new Date(expiryDate);
+      }
+      
+      const promoCode = await storage.createPromoCode({
+        code,
+        days: daysNum,
+        maxUses: maxUsesNum,
+        promoType: promoType as 'role' | 'course',
+        targetRole: targetRole || 'E-BASIC',
+        courseId: courseIdNum,
+        isActive: true,
+        createdBy: req.user.id,
+        validUntil: expiryDateObj,
+      });
+      
+      res.status(201).json(promoCode);
+    } catch (error) {
+      console.error("Error creating promo code:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Use promo code
+  app.post("/api/promocodes/use", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const { code } = req.body;
+      
+      if (!code) {
+        return res.status(400).json({ message: "Código promocional é obrigatório" });
+      }
+      
+      // Check if it's a course promo code
+      const promoCode = await storage.getPromoCodeByCode(code);
+      
+      if (!promoCode) {
+        return res.status(404).json({ message: "Código promocional não encontrado" });
+      }
+      
+      if (promoCode.promoType === 'course') {
+        if (!promoCode.courseId) {
+          return res.status(400).json({ message: "Código promocional inválido: curso não especificado" });
+        }
+        
+        const result = await storage.useCoursePromoCode(code, promoCode.courseId, req.user.id);
+        return res.json(result);
+      } else {
+        // Role promo code
+        const result = await storage.usePromoCode(code, req.user.id);
+        return res.json(result);
+      }
+    } catch (error) {
+      console.error("Error using promo code:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Delete promo code (admin only)
+  app.delete("/api/promocodes/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const promoId = parseInt(req.params.id);
+      
+      const success = await storage.deletePromoCode(promoId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Falha ao excluir código promocional" });
+      }
+      
+      res.json({ success: true, message: "Código promocional excluído com sucesso" });
+    } catch (error) {
+      console.error("Error deleting promo code:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get all notifications
+  app.get("/api/notifications", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const targetRole = req.user.role;
+      const userId = req.user.id;
+      
+      const notifications = await storage.getNotifications(targetRole, userId);
+      res.json(notifications);
+    } catch (error) {
+      console.error("Error fetching notifications:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create notification (admin only)
+  app.post("/api/notifications", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { title, message, type, targetRole, link, userId } = req.body;
+      
+      // Verificar se é uma notificação para um usuário específico
+      if (userId) {
+        // Notificação individual para um usuário específico
+        const notification = await storage.createNotification({
+          title,
+          message,
+          type,
+          targetRole: 'individual', // Definir como individual quando destinada a um usuário específico
+          link,
+          userId,
+          createdBy: req.user.id
+        });
+        
+        res.status(201).json(notification);
+      } 
+      // Notificação para um papel específico ou para todos
+      else {
+        const notification = await storage.createNotification({
+          title,
+          message,
+          type,
+          targetRole: targetRole || 'all', // Default para 'all' se não especificado
+          link,
+          userId: null, // Garantir que userId seja null para notificações de papel ou gerais
+          createdBy: req.user.id
+        });
+        
+        res.status(201).json(notification);
+      }
+    } catch (error) {
+      console.error("Error creating notification:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Criar notificações para todos os usuários de um determinado papel
+  app.post("/api/notifications/bulk", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { title, message, type, targetRole, link } = req.body;
+      
+      if (!targetRole || targetRole === 'all') {
+        // Se o targetRole for 'all' ou não for especificado, busca todos os usuários
+        const allUsers = await storage.getAllUsers();
+        
+        const notifications = await Promise.all(
+          allUsers.map(user => 
+            storage.createNotification({
+              title,
+              message,
+              type: type || 'info',
+              targetRole: 'individual', // Sempre individual para notificações em massa
+              link,
+              userId: user.id,
+              createdBy: req.user.id
+            })
+          )
+        );
+        
+        res.status(201).json({ 
+          message: `Notificação enviada para ${notifications.length} usuários`,
+          count: notifications.length 
+        });
+      } 
+      else {
+        // Buscar todos os usuários com o papel específico
+        const usersWithRole = await storage.getAllUsers().then(users => 
+          users.filter(user => user.role === targetRole)
+        );
+        
+        const notifications = await Promise.all(
+          usersWithRole.map(user => 
+            storage.createNotification({
+              title,
+              message,
+              type: type || 'info',
+              targetRole: 'individual', // Sempre individual para notificações em massa
+              link,
+              userId: user.id,
+              createdBy: req.user.id
+            })
+          )
+        );
+        
+        res.status(201).json({ 
+          message: `Notificação enviada para ${notifications.length} usuários com papel ${targetRole}`,
+          count: notifications.length 
+        });
+      }
+    } catch (error) {
+      console.error("Error creating bulk notifications:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Mark notification as read
+  app.patch("/api/notifications/:id/read", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const notificationId = parseInt(req.params.id);
+      
+      const notification = await storage.markNotificationAsRead(notificationId);
+      
+      if (!notification) {
+        return res.status(404).json({ message: "Notificação não encontrada" });
+      }
+      
+      res.json(notification);
+    } catch (error) {
+      console.error("Error marking notification as read:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Delete notification (admin only)
+  app.delete("/api/notifications/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const notificationId = parseInt(req.params.id);
+      
+      const success = await storage.deleteNotification(notificationId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Falha ao excluir notificação" });
+      }
+      
+      res.json({ success: true, message: "Notificação excluída com sucesso" });
+    } catch (error) {
+      console.error("Error deleting notification:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get course details
+  app.get("/api/courses/:id", async (req, res) => {
+    try {
+      const courseId = parseInt(req.params.id);
+      
+      const course = await storage.getCourseById(courseId);
+      
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      // If course is hidden and user is not admin, don't show it
+      if (course.isHidden && (!req.isAuthenticated() || req.user.role !== "admin")) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      // Get lessons for this course
+      const lessons = await storage.getLessonsByCourseId(courseId);
+      
+      // Get materials for this course
+      const materials = await storage.getMaterialsByCourseId(courseId);
+      
+      // Check if user has course access
+      let hasAccess = false;
+      if (req.isAuthenticated()) {
+        // Admins have access to everything
+        if (req.user.role === "admin") {
+          hasAccess = true;
+        } else if (req.user.role === "E-MASTER") {
+          // E-MASTER has access to all non-hidden courses
+          hasAccess = !course.isHidden;
+        } else {
+          // Check specific course access for other roles
+          hasAccess = await storage.checkCourseAccess(courseId, req.user.id);
+        }
+      }
+      
+      res.json({
+        course,
+        lessons,
+        materials,
+        hasAccess
+      });
+    } catch (error) {
+      console.error("Error fetching course details:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // ===== CHAT ROUTES =====
+  
+  // Get user's chat threads
+  app.get("/api/chat/threads", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const threads = await storage.getChatThreads(req.user.id);
+      res.json(threads);
+    } catch (error) {
+      console.error("Error fetching chat threads:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get admin chat threads
+  app.get("/api/chat/admin/threads", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const threads = await storage.getAdminChatThreads();
+      res.json(threads);
+    } catch (error) {
+      console.error("Error fetching admin chat threads:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get unread count for admin
+  app.get("/api/chat/admin/unread-count", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const count = await storage.getUnreadThreadsCountForAdmin();
+      res.json({ count });
+    } catch (error) {
+      console.error("Error fetching unread count:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get unread count for user
+  app.get("/api/chat/unread-count", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const count = await storage.getUnreadThreadsCountForUser(req.user.id);
+      res.json({ count });
+    } catch (error) {
+      console.error("Error fetching unread count:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create new chat thread
+  app.post("/api/chat/threads", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const { subject } = req.body;
+      
+      if (!subject) {
+        return res.status(400).json({ message: "Assunto é obrigatório" });
+      }
+      
+      const thread = await storage.createChatThread({
+        subject,
+        userId: req.user.id,
+        status: "open",
+        isUserUnread: false,
+        isAdminUnread: true
+      });
+      
+      // Criar notificação para os administradores sobre o novo ticket
+      const adminUsers = await storage.getAllUsers().then(users => 
+        users.filter(user => user.role === 'admin')
+      );
+      
+      // Enviar notificação para cada administrador
+      for (const admin of adminUsers) {
+        await storage.createNotification({
+          title: "Novo ticket de suporte",
+          message: `Um novo ticket foi aberto: "${subject}" por ${req.user.username}`,
+          type: "info",
+          targetRole: "individual",
+          userId: admin.id,
+          link: `/admin/chats/${thread.id}`,
+          createdBy: req.user.id
+        });
+      }
+      
+      // Criar notificação para o usuário que abriu o ticket
+      await storage.createNotification({
+        title: "Ticket aberto com sucesso",
+        message: `Seu ticket "${subject}" foi aberto com sucesso. Aguarde a resposta de um administrador.`,
+        type: "success",
+        targetRole: "individual",
+        userId: req.user.id,
+        link: `/chat/${thread.id}`,
+        createdBy: req.user.id
+      });
+      
+      res.status(201).json(thread);
+    } catch (error) {
+      console.error("Error creating chat thread:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get chat thread details
+  app.get("/api/chat/threads/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const threadId = parseInt(req.params.id);
+      
+      const thread = await storage.getChatThreadById(threadId);
+      
+      if (!thread) {
+        return res.status(404).json({ message: "Conversa não encontrada" });
+      }
+      
+      // Only the thread owner or an admin can view it
+      if (thread.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      // Mark thread as read by the user
+      if (thread.userId === req.user.id) {
+        await storage.markThreadAsReadForUser(threadId);
+      } else if (req.user.role === "admin") {
+        await storage.markThreadAsReadForAdmin(threadId);
+      }
+      
+      // Se o admin estiver visualizando, adicione informações do usuário
+      if (req.user.role === "admin") {
+        const user = await storage.getUser(thread.userId);
+        if (user) {
+          thread.userName = user.username;
+        }
+      }
+      
+      res.json({ thread });
+    } catch (error) {
+      console.error("Error fetching chat thread details:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Get messages for chat thread
+  app.get("/api/chat/threads/:id/messages", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const threadId = parseInt(req.params.id);
+      
+      const thread = await storage.getChatThreadById(threadId);
+      
+      if (!thread) {
+        return res.status(404).json({ message: "Conversa não encontrada" });
+      }
+      
+      // Only the thread owner or an admin can view messages
+      if (thread.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      const messages = await storage.getChatMessagesByThreadId(threadId);
+      
+      res.json(messages);
+    } catch (error) {
+      console.error("Error fetching chat messages:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Create new chat message
+  app.post("/api/chat/threads/:id/messages", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const threadId = parseInt(req.params.id);
+      const { message } = req.body;
+      
+      if (!message) {
+        return res.status(400).json({ message: "Conteúdo da mensagem é obrigatório" });
+      }
+      
+      const thread = await storage.getChatThreadById(threadId);
+      
+      if (!thread) {
+        return res.status(404).json({ message: "Conversa não encontrada" });
+      }
+      
+      // Only the thread owner or an admin can post messages
+      if (thread.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      // If thread is closed, only admin can reopen it
+      if (thread.status === "closed" && req.user.role !== "admin") {
+        return res.status(400).json({ message: "Esta conversa está fechada" });
+      }
+      
+      // If thread was closed and admin is responding, reopen it
+      if (thread.status === "closed" && req.user.role === "admin") {
+        await storage.updateChatThread(threadId, { status: "open" });
+      }
+      
+      // Determine if this is an admin message
+      const isAdminMessage = req.user.role === "admin";
+      
+      // Update read status based on who's sending the message
+      if (isAdminMessage) {
+        await storage.markThreadAsReadForAdmin(threadId);
+        await storage.updateChatThread(threadId, { isUserUnread: true });
+        
+        // Create notification for user that admin replied
+        await storage.createNotification({
+          title: "Nova mensagem de suporte",
+          message: `Você recebeu uma resposta no ticket "${thread.subject}"`,
+          type: "chat",
+          targetRole: "individual",
+          userId: thread.userId,
+          link: `/chat/${threadId}`,
+          createdBy: req.user.id
+        });
+      } else {
+        await storage.markThreadAsReadForUser(threadId);
+        await storage.updateChatThread(threadId, { isAdminUnread: true });
+      }
+      
+      // Create the message
+      const chatMessage = await storage.createChatMessage({
+        threadId,
+        message,
+        userId: req.user.id,
+        isAdminMessage
+      });
+      
+      res.status(201).json(chatMessage);
+    } catch (error) {
+      console.error("Error creating chat message:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Close chat thread
+  app.patch("/api/chat/threads/:id/close", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const threadId = parseInt(req.params.id);
+      
+      const thread = await storage.getChatThreadById(threadId);
+      
+      if (!thread) {
+        return res.status(404).json({ message: "Conversa não encontrada" });
+      }
+      
+      // Only the thread owner or an admin can close it
+      if (thread.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      const updatedThread = await storage.closeChatThread(threadId);
+      
+      if (!updatedThread) {
+        return res.status(500).json({ message: "Falha ao fechar conversa" });
+      }
+      
+      // If admin closed the thread, notify the user
+      if (req.user.role === "admin" && thread.userId !== req.user.id) {
+        await storage.createNotification({
+          title: "Ticket fechado",
+          message: `Seu ticket "${thread.subject}" foi fechado pelo administrador`,
+          type: "chat",
+          targetRole: "individual",
+          userId: thread.userId,
+          link: `/chat/${threadId}`,
+          createdBy: req.user.id
+        });
+      }
+      
+      res.json(updatedThread);
+    } catch (error) {
+      console.error("Error closing chat thread:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // Delete chat thread (admin only)
+  app.delete("/api/chat/threads/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const threadId = parseInt(req.params.id);
+      
+      const thread = await storage.getChatThreadById(threadId);
+      
+      if (!thread) {
+        return res.status(404).json({ message: "Conversa não encontrada" });
+      }
+      
+      // Delete all messages in this thread
+      const success = await pool.query('DELETE FROM chat_messages WHERE thread_id = $1', [threadId]);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Falha ao excluir mensagens" });
+      }
+      
+      // Delete the thread
+      const threadSuccess = await pool.query('DELETE FROM chat_threads WHERE id = $1', [threadId]);
+      
+      if (!threadSuccess) {
+        return res.status(500).json({ message: "Falha ao excluir conversa" });
+      }
+      
+      res.json({ success: true, message: "Conversa excluída com sucesso" });
+    } catch (error) {
+      console.error("Error deleting chat thread:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Webservices e outras rotas existentes...
+  // (código existente omitido para brevidade)
+
+  // ===== ROTAS DE UPGRADE COM STRIPE =====
+  
+  // Rota movida para implementação mais abaixo que usa preços do banco de dados
+  
+  // Criar intenção de pagamento para upgrade de plano
+  app.post("/api/upgrade/create-payment-intent", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const { planType, months } = req.body;
+      
+      if (!planType || !months) {
+        return res.status(400).json({ message: "Plano e duração são obrigatórios" });
+      }
+      
+      // Validação de meses (entre 1 e 12)
+      const monthsNum = parseInt(months);
+      if (isNaN(monthsNum) || monthsNum < 1 || monthsNum > 12) {
+        return res.status(400).json({ message: "Duração inválida. Escolha entre 1 e 12 meses" });
+      }
+      
+      // Verificar se o usuário está tentando fazer upgrade para um plano menor
+      const roleHierarchy: { [key: string]: number } = {
+        'E-BASIC': 1,
+        'E-TOOL': 2,
+        'E-MASTER': 3,
+        'admin': 4
+      };
+      
+      const currentRoleValue = roleHierarchy[req.user.role] || 0;
+      const planRoleValue = roleHierarchy[planType] || 0;
+      
+      if (planRoleValue <= currentRoleValue) {
+        return res.status(400).json({ 
+          message: "Você não pode fazer upgrade para um plano de nível inferior ou igual ao seu plano atual" 
+        });
+      }
+      
+      // Buscar preço do plano no banco de dados
+      const planPrices = await db.query.planPrices.findMany({
+        where: eq(schema.planPrices.planType, planType)
+      });
+      
+      if (!planPrices || planPrices.length === 0) {
+        return res.status(400).json({ message: "Plano não encontrado" });
+      }
+      
+      const monthlyPrice = parseFloat(planPrices[0].monthlyPrice.toString());
+      const totalPrice = monthlyPrice * monthsNum;
+      const amountInCents = Math.round(totalPrice * 100);
+      const totalDays = monthsNum * 30; // Aproximadamente 30 dias por mês
+      
+      // Criar ou atualizar cliente no Stripe
+      let customerId = req.user.stripeCustomerId;
+      
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: req.user.email,
+          name: req.user.username,
+          metadata: {
+            userId: req.user.id.toString()
+          }
+        });
+        
+        customerId = customer.id;
+        
+        // Atualizar o ID do cliente do Stripe no banco de dados
+        await storage.updateStripeCustomerId(req.user.id, customerId);
+      }
+      
+      // Criar intenção de pagamento
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amountInCents,
+        currency: 'brl',
+        customer: customerId,
+        metadata: {
+          type: 'plan_upgrade',
+          upgradeType: 'role', // Adicionando o campo upgradeType que é verificado no webhook
+          planType,
+          userId: req.user.id.toString(),
+          days: totalDays.toString(),
+          months: monthsNum.toString(),
+          durationDays: totalDays.toString(), // Também adicionando durationDays que é usado no webhook
+          monthlyPrice: monthlyPrice.toString(),
+          totalPrice: totalPrice.toString()
+        }
+      });
+      
+      res.json({
+        clientSecret: paymentIntent.client_secret
+      });
+    } catch (error: any) {
+      console.error("Erro ao criar intenção de pagamento:", error);
+      res.status(500).json({ message: "Erro ao processar pagamento" });
+    }
+  });
+  
+  // Criar intenção de pagamento para um curso específico
+  app.post("/api/courses/create-payment-intent", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const { courseId, price } = req.body;
+      
+      if (!courseId || !price) {
+        return res.status(400).json({ message: "ID do curso e preço são obrigatórios" });
+      }
+      
+      // Buscar o curso para verificar se ele existe
+      const course = await storage.getCourseById(parseInt(courseId));
+      
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      // Verificar se o usuário já tem acesso ao curso
+      const hasAccess = await storage.checkCourseAccess(parseInt(courseId), req.user.id);
+      
+      if (hasAccess) {
+        return res.status(400).json({ message: "Você já tem acesso a este curso" });
+      }
+      
+      // Criar ou atualizar cliente no Stripe
+      let customerId = req.user.stripeCustomerId;
+      
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: req.user.email,
+          name: req.user.username,
+          metadata: {
+            userId: req.user.id.toString()
+          }
+        });
+        
+        customerId = customer.id;
+        
+        // Atualizar o ID do cliente do Stripe no banco de dados
+        await storage.updateStripeCustomerId(req.user.id, customerId);
+      }
+      
+      // Criar produto no Stripe para o curso (se necessário)
+      let product;
+      
+      try {
+        // Verificar se o produto já existe
+        product = await stripe.products.retrieve(`course_${courseId}`);
+      } catch (error) {
+        // Criar o produto se não existir
+        product = await stripe.products.create({
+          id: `course_${courseId}`,
+          name: course.title,
+          description: course.description || `Curso: ${course.title}`,
+          metadata: {
+            courseId: courseId.toString()
+          }
+        });
+      }
+      
+      // Converter o preço para centavos
+      const amountInCents = Math.round(parseFloat(price) * 100);
+      
+      // Criar intenção de pagamento
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amountInCents,
+        currency: 'brl',
+        customer: customerId,
+        metadata: {
+          type: 'course_purchase',
+          courseId: courseId.toString(),
+          userId: req.user.id.toString(),
+          productId: product.id
+        }
+      });
+      
+      res.json({
+        clientSecret: paymentIntent.client_secret
+      });
+    } catch (error: any) {
+      console.error("Erro ao criar intenção de pagamento para curso:", error);
+      res.status(500).json({ message: "Erro ao processar pagamento" });
+    }
+  });
+  
+  // Confirmar pagamento e atualizar o usuário
+  app.post("/api/upgrade/confirm-payment", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      const { paymentIntentId } = req.body;
+      
+      if (!paymentIntentId) {
+        return res.status(400).json({ message: "ID da intenção de pagamento é obrigatório" });
+      }
+      
+      // Recuperar intenção de pagamento do Stripe
+      const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+      
+      // Verificar se o pagamento foi bem-sucedido
+      if (paymentIntent.status !== 'succeeded') {
+        return res.status(400).json({ message: "Pagamento não concluído com sucesso" });
+      }
+      
+      // Verificar se o usuário é o dono do pagamento
+      if (paymentIntent.metadata.userId !== req.user.id.toString()) {
+        return res.status(403).json({ message: "Acesso negado" });
+      }
+      
+      // Determinar o tipo de pagamento (upgrade de plano ou compra de curso)
+      const paymentType = paymentIntent.metadata.type;
+      
+      if (paymentType === 'plan_upgrade') {
+        // Processamento de upgrade de plano
+        const planType = paymentIntent.metadata.planType;
+        const days = parseInt(paymentIntent.metadata.days || '0');
+        
+        if (!planType || !days) {
+          return res.status(400).json({ message: "Dados de plano inválidos" });
+        }
+        
+        // Atualizar o usuário com os detalhes do Stripe
+        await storage.updateStripeInfo(
+          req.user.id, 
+          paymentIntent.customer as string, 
+          paymentIntent.id
+        );
+        
+        // Estender status pro com os dias do plano
+        const updatedUser = await storage.extendProStatus(req.user.id, days);
+        
+        // Atualizar o papel do usuário
+        if (updatedUser) {
+          await storage.updateUser(req.user.id, { role: planType });
+          
+          // Adicionar notificação sobre o upgrade
+          await storage.createNotification({
+            title: "Upgrade de plano concluído",
+            message: `Seu upgrade para o plano ${planType === 'E-TOOL' ? 'E-TOOL' : 'E-MASTER'} foi concluído com sucesso. O plano é válido por ${days} dias.`,
+            type: "success",
+            targetRole: "individual",
+            userId: req.user.id,
+            link: "/account",
+            createdBy: req.user.id
+          });
+        }
+        
+        res.json({ 
+          success: true,
+          message: "Upgrade de plano concluído com sucesso!"
+        });
+      } 
+      else if (paymentType === 'course_purchase') {
+        // Processamento de compra de curso
+        const courseId = parseInt(paymentIntent.metadata.courseId || '0');
+        
+        if (!courseId) {
+          return res.status(400).json({ message: "Dados do curso inválidos" });
+        }
+        
+        // Verificar se o curso existe
+        const course = await storage.getCourseById(courseId);
+        
+        if (!course) {
+          return res.status(404).json({ message: "Curso não encontrado" });
+        }
+        
+        // Criar um código promocional para o usuário ter acesso ao curso
+        // Este código já será usado automaticamente
+        const promoCode = await storage.createPromoCode({
+          code: `PURCHASE_${req.user.id}_${courseId}_${Date.now()}`,
+          days: 365 * 5, // 5 anos de acesso
+          maxUses: 1,
+          isActive: true,
+          promoType: 'course',
+          courseId,
+          targetRole: req.user.role,
+          createdBy: req.user.id,
+          validUntil: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 5) // 5 anos
+        });
+        
+        // Usar o código promocional para o usuário
+        const result = await storage.useCoursePromoCode(promoCode.code, courseId, req.user.id);
+        
+        if (!result.success) {
+          return res.status(400).json({ message: result.message });
+        }
+        
+        // Adicionar notificação sobre a compra
+        await storage.createNotification({
+          title: "Compra de curso concluída",
+          message: `Sua compra do curso "${course.title}" foi concluída com sucesso. Você já tem acesso ao conteúdo!`,
+          type: "success",
+          targetRole: "individual",
+          userId: req.user.id,
+          link: `/course/${courseId}`,
+          createdBy: req.user.id
+        });
+        
+        res.json({ 
+          success: true,
+          message: "Compra de curso concluída com sucesso!"
+        });
+      }
+      else {
+        return res.status(400).json({ message: "Tipo de pagamento não reconhecido" });
+      }
+    } catch (error: any) {
+      console.error("Erro ao confirmar pagamento:", error);
+      res.status(500).json({ message: "Erro ao processar confirmação de pagamento" });
+    }
+  });
+  
+  // Obter planos disponíveis para upgrade
+  app.get("/api/upgrade/plans", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    
+    try {
+      // Planos disponíveis baseados no papel atual do usuário
+      const currentRole = req.user.role;
+      const plans: Record<string, any> = {};
+      
+      // Obter preços dos planos do banco de dados
+      const planPricesResult = await db.query.planPrices.findMany();
+      const planPrices: Record<string, any> = {};
+      
+      planPricesResult.forEach(plan => {
+        planPrices[plan.planType] = {
+          monthlyPrice: parseFloat(plan.monthlyPrice.toString())
+        };
+      });
+      
+      // Lógica para definir quais planos estão disponíveis
+      if (currentRole === "E-BASIC") {
+        if (planPrices["E-TOOL"]) {
+          plans["E-TOOL"] = {
+            name: "Plano E-TOOL", 
+            description: "Acesso às ferramentas exclusivas E-TOOL",
+            price: Math.round(planPrices["E-TOOL"].monthlyPrice * 100), // Converter para centavos
+            monthlyPrice: planPrices["E-TOOL"].monthlyPrice,
+            days: 30,
+            minMonths: 1,
+            maxMonths: 12
+          };
+        }
+        
+        if (planPrices["E-MASTER"]) {
+          plans["E-MASTER"] = {
+            name: "Plano E-MASTER",
+            description: "Acesso completo a todas as ferramentas e cursos disponíveis",
+            price: Math.round(planPrices["E-MASTER"].monthlyPrice * 100), // Converter para centavos
+            monthlyPrice: planPrices["E-MASTER"].monthlyPrice,
+            days: 30,
+            minMonths: 1,
+            maxMonths: 12
+          };
+        }
+      } else if (currentRole === "E-TOOL") {
+        if (planPrices["E-MASTER"]) {
+          // Desconto de 20% para upgrade de E-TOOL para E-MASTER
+          const discountedPrice = planPrices["E-MASTER"].monthlyPrice * 0.8;
+          
+          plans["E-MASTER"] = {
+            name: "Plano E-MASTER",
+            description: "Acesso completo a todas as ferramentas e cursos disponíveis",
+            price: Math.round(discountedPrice * 100), // Converter para centavos
+            monthlyPrice: discountedPrice,
+            days: 30,
+            minMonths: 1,
+            maxMonths: 12
+          };
+        }
+      }
+      
+      res.json(plans);
+    } catch (error) {
+      console.error("Erro ao obter planos:", error);
+      res.status(500).json({ message: "Erro interno do servidor" });
+    }
+  });
+
+  // Rota movida para a parte superior do arquivo
+
+  // Atualizar preço de um curso (admin)
+  app.post("/api/courses/:id/set-price", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { id } = req.params;
+      const { price } = req.body;
+      
+      if (price === undefined) {
+        return res.status(400).json({ message: "Preço é obrigatório" });
+      }
+      
+      const courseId = parseInt(id);
+      
+      // Verificar se o curso existe
+      const course = await storage.getCourseById(courseId);
+      
+      if (!course) {
+        return res.status(404).json({ message: "Curso não encontrado" });
+      }
+      
+      // Atualizar o preço do curso - garantir que o preço seja uma string para o decimal no banco
+      const updatedCourse = await storage.updateCourse(courseId, { price: price.toString() });
+      
+      if (!updatedCourse) {
+        return res.status(400).json({ message: "Falha ao atualizar o preço do curso" });
+      }
+      
+      // Atualizar ou criar o preço no Stripe
+      let product;
+      
+      try {
+        // Verificar se o produto já existe
+        product = await stripe.products.retrieve(`course_${courseId}`);
+      } catch (error) {
+        // Criar o produto se não existir
+        product = await stripe.products.create({
+          id: `course_${courseId}`,
+          name: course.title,
+          description: course.description || `Curso: ${course.title}`,
+          metadata: {
+            courseId: courseId.toString()
+          }
+        });
+      }
+      
+      res.json({
+        success: true,
+        course: updatedCourse
+      });
+    } catch (error: any) {
+      console.error("Erro ao definir preço do curso:", error);
+      res.status(500).json({ message: "Erro interno do servidor" });
+    }
+  });
+
+  // Novos endpoints para gerenciamento de preços (para uso no novo sistema de gerenciamento de preços)
+  // Endpoint para atualizar preço de curso
+  app.post("/api/admin/course-prices", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { courseId, price } = req.body;
+      
+      if (courseId === undefined || price === undefined) {
+        return res.status(400).json({
+          message: "ID do curso e preço são obrigatórios"
+        });
+      }
+      
+      // Verificar se o curso existe
+      const course = await storage.getCourseById(courseId);
+      if (!course) {
+        return res.status(404).json({
+          message: "Curso não encontrado"
+        });
+      }
+      
+      const updatedCourse = await storage.updateCourse(courseId, { price: price.toString() });
+      
+      res.status(200).json({
+        success: true,
+        course: updatedCourse
+      });
+    } catch (error) {
+      console.error("Erro ao atualizar preço do curso:", error);
+      res.status(500).json({ message: "Erro interno do servidor" });
+    }
+  });
+  
+  // Endpoint para obter preços dos planos
+  app.get("/api/upgrade/plans/prices", async (req, res) => {
+    try {
+      const planPrices = await db.query.planPrices.findMany();
+      
+      // Formatar os resultados para facilitar acesso no cliente
+      const formattedPrices: Record<string, any> = {};
+      
+      planPrices.forEach(plan => {
+        formattedPrices[plan.planType] = {
+          monthlyPrice: parseFloat(plan.monthlyPrice.toString())
+        };
+      });
+      
+      res.json(formattedPrices);
+    } catch (error) {
+      console.error("Erro ao buscar preços dos planos:", error);
+      res.status(500).json({ message: "Erro interno do servidor" });
+    }
+  });
+
+  // Endpoint para atualizar preço de plano
+  app.post("/api/admin/plan-prices", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    
+    try {
+      const { planType, monthlyPrice } = req.body;
+      
+      if (!planType || monthlyPrice === undefined) {
+        return res.status(400).json({
+          message: "Tipo de plano e preço mensal são obrigatórios"
+        });
+      }
+      
+      // Verificar se o tipo de plano é válido
+      if (planType !== "E-TOOL" && planType !== "E-MASTER") {
+        return res.status(400).json({
+          message: "Tipo de plano inválido. Deve ser 'E-TOOL' ou 'E-MASTER'"
+        });
+      }
+
+      // Atualizar preço no banco de dados
+      const existingPrice = await db.query.planPrices.findFirst({
+        where: eq(schema.planPrices.planType, planType)
+      });
+
+      if (existingPrice) {
+        // Atualizar preço existente
+        await db.update(schema.planPrices)
+          .set({ monthlyPrice: monthlyPrice.toString() })
+          .where(eq(schema.planPrices.planType, planType));
+      } else {
+        // Inserir novo preço
+        await db.insert(schema.planPrices).values({
+          planType,
+          monthlyPrice: monthlyPrice.toString()
+        });
+      }
+      
+      res.status(200).json({
+        success: true,
+        planType,
+        monthlyPrice
+      });
+    } catch (error) {
+      console.error("Erro ao atualizar preço do plano:", error);
+      res.status(500).json({ message: "Erro interno do servidor" });
+    }
+  });
+
+  // Função para obter o usuário a partir do ID da sessão
+  async function getSessionUser(sessionId: string): Promise<schema.User | null> {
+    try {
+      // Obter a sessão do banco
+      const result = await pool.query(
+        'SELECT sess FROM session WHERE sid = $1',
+        [sessionId]
+      );
+      
+      if (result.rows.length === 0) {
+        return null;
+      }
+      
+      // Extrair o ID do usuário da sessão
+      const session = result.rows[0].sess;
+      const passport = session?.passport;
+      
+      if (!passport || !passport.user) {
+        return null;
+      }
+      
+      const userId = passport.user;
+      
+      // Buscar o usuário no banco
+      const user = await storage.getUser(userId);
+      
+      return user || null;
+    } catch (error) {
+      console.error('Erro ao obter usuário da sessão:', error);
+      return null;
+    }
+  }
+
+  // Webhook para receber eventos do Stripe
+  app.post("/api/stripe/webhook", async (req, res) => {
+    try {
+      const sig = req.headers['stripe-signature'];
+      
+      if (!sig) {
+        return res.status(400).json({ message: "Faltando assinatura do Stripe" });
+      }
+      
+      let event;
+      
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.body,
+          sig,
+          process.env.STRIPE_WEBHOOK_SECRET || ""
+        );
+      } catch (err: any) {
+        console.error(`Erro na verificação da assinatura: ${err.message}`);
+        return res.status(400).json({ message: `Erro na verificação da assinatura: ${err.message}` });
+      }
+      
+      // Processar evento de pagamento bem-sucedido
+      if (event.type === 'payment_intent.succeeded') {
+        const paymentIntent = event.data.object as Stripe.PaymentIntent;
+        const { metadata } = paymentIntent;
+        
+        if (!metadata) {
+          return res.status(400).json({ message: "Pagamento sem metadados" });
+        }
+        
+        // Verificar o tipo de upgrade
+        const upgradeType = metadata.upgradeType;
+        
+        if (upgradeType === "role") {
+          // Processar upgrade de papel
+          const userId = parseInt(metadata.userId || "0");
+          const planType = metadata.planType;
+          
+          if (!userId || !planType) {
+            return res.status(400).json({ message: "Metadados de pagamento inválidos" });
+          }
+          
+          // Verificar se o plano é válido
+          if (planType !== 'E-TOOL' && planType !== 'E-MASTER') {
+            return res.status(400).json({ message: "Tipo de plano inválido" });
+          }
+          
+          // Pegar o usuário atual
+          const user = await storage.getUser(userId);
+          
+          if (!user) {
+            return res.status(404).json({ message: "Usuário não encontrado" });
+          }
+          
+          // Obter a duração em dias dos metadados ou usar 30 dias como padrão
+          const durationDays = parseInt(metadata.durationDays || "30");
+          
+          // Calcular data de expiração com base na duração
+          const expiryDate = new Date();
+          expiryDate.setDate(expiryDate.getDate() + durationDays);
+          
+          // Atualizar papel do usuário
+          const updatedUser = await storage.updateUser(userId, { 
+            role: planType,
+            roleExpiryDate: expiryDate
+          });
+          
+          // Adicionar notificação sobre o upgrade
+          if (updatedUser) {
+            await storage.createNotification({
+              title: "Upgrade de plano concluído",
+              message: `Seu upgrade para o plano ${planType} foi concluído com sucesso! Válido até ${expiryDate.toLocaleDateString('pt-BR')}.`,
+              type: "success",
+              targetRole: "individual",
+              userId: userId,
+              link: "/account"
+            });
+            
+            console.log(`Usuário ${userId} atualizado para ${planType} com sucesso`);
+          }
+        }
+      }
+      
+      res.json({ received: true });
+    } catch (error: any) {
+      console.error("Erro no webhook do Stripe:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Configurar servidor HTTP
+  const httpServer = createServer(app);
+  
+  // Configurar WebSocket Server
+  const wss = new WebSocketServer({ 
+    server: httpServer,
+    path: '/ws'
+  });
+  
+  // Manipular conexões de WebSocket
+  wss.on('connection', (ws: WebSocket) => {
+    let userId: number | null = null;
+    
+    ws.on('message', async (message: string) => {
+      try {
+        const data = JSON.parse(message);
+        
+        if (data.type === 'auth') {
+          // Autenticar usuário pelo sessionId
+          const sessionId = data.sessionId;
+          if (!sessionId) return;
+          
+          const user = await getSessionUser(sessionId);
+          
+          if (user) {
+            userId = user.id;
+            console.log(`WebSocket autenticado: usuário ${userId}`);
+            
+            // Enviar confirmação de autenticação
+            ws.send(JSON.stringify({
+              type: 'auth_result',
+              success: true,
+              userId
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: 'auth_result',
+              success: false,
+              error: 'Falha na autenticação'
+            }));
+          }
+        }
+      } catch (error) {
+        console.error('Erro ao processar mensagem WebSocket:', error);
+      }
+    });
+    
+    ws.on('close', () => {
+      if (userId) {
+        console.log(`WebSocket desconectado: usuário ${userId}`);
+      }
+    });
+  });
+
+  return httpServer;
+}
